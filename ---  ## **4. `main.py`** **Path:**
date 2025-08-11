@@ -1,0 +1,97 @@
+**Code:**
+```python
+#!/usr/bin/env python3
+import os
+import io
+import requests
+import pandas as pd
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN") or os.getenv("DHAN_ACCESS_TOKEN")
+CLIENT_ID = os.getenv("CLIENT_ID") or os.getenv("DHAN_CLIENT_ID")
+
+if not ACCESS_TOKEN or not CLIENT_ID:
+    raise SystemExit("Missing ACCESS_TOKEN or CLIENT_ID")
+
+SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
+
+HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "access-token": ACCESS_TOKEN,
+    "client-id": CLIENT_ID
+}
+
+def load_scrip_master():
+    r = requests.get(SCRIP_MASTER_URL, timeout=20)
+    r.raise_for_status()
+    return pd.read_csv(io.StringIO(r.text), dtype=str)
+
+def find_security_id(symbol, df):
+    symbol = symbol.upper()
+    cols = [c for c in df.columns if "symbol" in c.lower() or "name" in c.lower()]
+    id_cols = [c for c in df.columns if "security" in c.lower() or "token" in c.lower()]
+    for col in cols:
+        match = df[df[col].str.upper() == symbol]
+        if not match.empty:
+            for idc in id_cols:
+                if idc in match.columns:
+                    return match.iloc[0][idc]
+    return None
+
+def get_intraday(security_id, exchange="NSE_EQ", interval="15"):
+    url = "https://api.dhan.co/v2/charts/intraday"
+    tz = ZoneInfo("Asia/Kolkata")
+    to_dt = datetime.now(tz)
+    from_dt = to_dt - timedelta(hours=6)
+    payload = {
+        "securityId": str(security_id),
+        "exchangeSegment": exchange,
+        "instrument": "EQUITY",
+        "interval": interval,
+        "oi": False,
+        "fromDate": from_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "toDate": to_dt.strftime("%Y-%m-%d %H:%M:%S")
+    }
+    r = requests.post(url, headers=HEADERS, json=payload, timeout=30)
+    if r.status_code != 200:
+        return None
+    data = r.json()
+    df = pd.DataFrame({
+        "timestamp": data.get("timestamp", []),
+        "close": data.get("close", [])
+    })
+    if df.empty:
+        return None
+    df["datetime"] = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
+    df = df.sort_values("datetime").reset_index(drop=True)
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    return df
+
+def scan(symbols):
+    df_master = load_scrip_master()
+    matches = []
+    for sym in symbols:
+        secid = find_security_id(sym, df_master)
+        if not secid:
+            print(f"{sym}: securityId not found")
+            continue
+        df = get_intraday(secid)
+        if df is None or len(df) < 22:
+            continue
+        df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
+        prev, last = df.iloc[-2], df.iloc[-1]
+        if prev["close"] < prev["ema21"] and last["close"] > last["ema21"]:
+            matches.append((sym, last["datetime"], last["close"], last["ema21"]))
+    return matches
+
+if __name__ == "__main__":
+    watchlist = ["RELIANCE", "TCS", "INFY", "HDFCBANK"]
+    results = scan(watchlist)
+    if results:
+        print("Bullish 21 EMA Crossovers (15m):")
+        for sym, dt, close, ema in results:
+            print(f"{sym} | {dt} | close={close} ema21={ema}")
+    else:
+        print("No bullish 21 EMA crossovers found.")
